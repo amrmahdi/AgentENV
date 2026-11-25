@@ -734,7 +734,7 @@ impl ImageFile {
                 .await
             {
                 Ok((remote_file, request)) => (remote_file, Some(request)),
-                Err(err) if err.is::<crate::backend::ThrottledRead>() => return Err(err),
+                Err(err) if err.is::<crate::backend::RegistryReadError>() => return Err(err),
                 // Background request construction is an optimization; a
                 // cache/source hiccup must not abort the image open. Log only
                 // the fixed category (the error chain may embed the URL).

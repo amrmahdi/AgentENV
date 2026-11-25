@@ -35,6 +35,7 @@ use super::startup_pack_task::{
     run_startup_pack_task, StartupPackPhase, StartupPackStatsSnapshot, StartupPackSubmission,
     StartupPackTask,
 };
+use crate::backend::RegistryReadError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -790,7 +791,7 @@ async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) -> Run
         {
             Ok(file) => file,
             Err(error) => {
-                if attempt + 1 < attempts {
+                if attempt + 1 < attempts && !error.is::<RegistryReadError>() {
                     interruptible_sleep(
                         retry_backoff(attempt + 1, &task.cache_id),
                         &scheduler.running,
@@ -839,7 +840,7 @@ async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) -> Run
             ChunksOutcome::Failed(error) => error,
         };
         let error_category = download_error_category(&error);
-        if attempt + 1 < attempts {
+        if attempt + 1 < attempts && !error.is::<RegistryReadError>() {
             tracing::warn!(
                 attempt = attempt + 1,
                 error_category,
@@ -855,6 +856,7 @@ async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) -> Run
                 error_category,
                 "background cache download terminally failed"
             );
+            return RunOutcome::Done;
         }
     }
     RunOutcome::Done

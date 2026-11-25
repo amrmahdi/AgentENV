@@ -122,6 +122,11 @@ User-visible rootfs images are selected at the template API layer.
 | `publish_pulled_images` | boolean | `true` | Publish pulled standard OCI images to the shared repository in the background, as `aenv/<host>/<path>:<tag>`. See [Published copies of pulled images](../concepts/sandboxes/starting.md#published-copies-of-pulled-images). |
 | `publish_pulled_registries` | array of strings | `[]` | Registry hosts whose pulled images `publish_pulled_images` publishes. An empty list allows every registry. `aenv pull --image` publishes regardless of both keys. |
 
+For OverlayBD-native images, blob range reads retry HTTP 408, 429, 500, 502,
+503, and 504 with bounded exponential backoff and jitter. The reader honors
+`Retry-After` within the read deadline and reuses a cached redirect URL on
+temporary failures. A missing blob (404) fails immediately.
+
 ### How the three registry settings interact
 
 Image resolution runs in two phases, and the three keys act at different points:

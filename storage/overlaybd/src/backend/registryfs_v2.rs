@@ -1,10 +1,10 @@
 use super::local::LocalFile;
-use super::ThrottledRead;
+use super::RegistryReadError;
 use crate::config::{AuthConfig, CredentialConfig, GlobalConfig, ImageAuthResponse};
 use crate::io::virtual_file::VirtualFile;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use backon::{BackoffBuilder, ExponentialBuilder};
+use backon::{ExponentialBuilder, Retryable};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
@@ -31,7 +31,6 @@ const PROBE_PER_URL_LIFE: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRY_COUNT: u32 = 3;
 const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 128 * 1024 * 1024;
-const RETRY_BACKOFF: Duration = Duration::from_millis(1);
 const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
@@ -186,8 +185,7 @@ struct BlobAuthContext {
 #[derive(Debug)]
 enum ActualUrlResponse {
     Success(UrlInfo),
-    Unauthorized(StatusCode),
-    Other(StatusCode),
+    Unauthorized(RegistryReadError),
 }
 
 impl PreparedAuth {
@@ -334,8 +332,8 @@ impl RegistryFSImplV2 {
             .await
             .context(format!("challenge request failed for {url}"))?;
         let status = resp.status();
-        if !push && status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ThrottledRead::from_response(
+        if !push && (status.is_client_error() || status.is_server_error()) && !needs_auth(status) {
+            return Err(RegistryReadError::from_response(
                 &resp,
                 format!("failed to resolve actual url for {url}"),
             )
@@ -555,13 +553,6 @@ impl RegistryFSImplV2 {
             .await
             .context(format!("resolve actual URL request failed for {url}"))?;
         let status = resp.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ThrottledRead::from_response(
-                &resp,
-                format!("failed to resolve actual url for {url}"),
-            )
-            .into());
-        }
         if status.is_redirection() {
             let location = resp
                 .headers()
@@ -582,10 +573,15 @@ impl RegistryFSImplV2 {
                 expire_at: Instant::now() + MIN_URL_INFO_LIFE,
             }));
         }
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Ok(ActualUrlResponse::Unauthorized(status));
+        let error = RegistryReadError::from_response(
+            &resp,
+            format!("failed to resolve actual url for {url}"),
+        );
+        if needs_auth(status) {
+            Ok(ActualUrlResponse::Unauthorized(error))
+        } else {
+            Err(error.into())
         }
-        Ok(ActualUrlResponse::Other(status))
     }
 
     async fn get_actual_url_with_legacy_probe(
@@ -604,23 +600,11 @@ impl RegistryFSImplV2 {
                 }
                 Ok(info)
             }
-            ActualUrlResponse::Unauthorized(status) => {
+            ActualUrlResponse::Unauthorized(error) => {
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                )
-            }
-            ActualUrlResponse::Other(status) => {
-                if let Some(key) = auth.bearer_cache_key() {
-                    self.invalidate_scope_token(key);
-                }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                )
+                Err(error.into())
             }
         }
     }
@@ -657,16 +641,7 @@ impl RegistryFSImplV2 {
 
         match self.resolve_actual_url_once(url, auth.header()).await? {
             ActualUrlResponse::Success(info) => Ok(info),
-            ActualUrlResponse::Other(status) => {
-                if let Some(key) = auth.bearer_cache_key() {
-                    self.invalidate_scope_token(key);
-                }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                );
-            }
-            ActualUrlResponse::Unauthorized(_status) => {
+            ActualUrlResponse::Unauthorized(_) => {
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
@@ -679,19 +654,10 @@ impl RegistryFSImplV2 {
                             .await?
                         {
                             ActualUrlResponse::Success(info) => return Ok(info),
-                            ActualUrlResponse::Unauthorized(_status) => {
+                            ActualUrlResponse::Unauthorized(_) => {
                                 if let Some(key) = refreshed.bearer_cache_key() {
                                     self.invalidate_scope_token(key);
                                 }
-                            }
-                            ActualUrlResponse::Other(status) => {
-                                if let Some(key) = refreshed.bearer_cache_key() {
-                                    self.invalidate_scope_token(key);
-                                }
-                                bail!(
-                                    "failed to resolve actual url for {url}: http status {}",
-                                    status.as_u16()
-                                );
                             }
                         }
                     }
@@ -754,14 +720,7 @@ impl RegistryFSImplV2 {
         if resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT {
             return Ok(resp);
         }
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ThrottledRead::from_response(
-                &resp,
-                "range request returned non-2xx".into(),
-            )
-            .into());
-        }
-        Err(http_status_error(resp, "range request returned non-2xx"))
+        Err(RegistryReadError::from_response(&resp, "range request returned non-2xx".into()).into())
     }
 
     async fn fetch_range_response(
@@ -787,11 +746,39 @@ impl RegistryFSImplV2 {
         let result = self
             .send_range_request(&request_url, auth_header, offset, count)
             .await;
-        // A 429 does not invalidate the resolved URL or credentials. Retry the same range.
-        if result.as_ref().is_err_and(|err| !err.is::<ThrottledRead>()) {
+        // A signed URL or cached credential may have expired. Temporary upstream
+        // failures can retry the same URL without a new registry lookup.
+        if result.as_ref().is_err_and(|err| {
+            err.downcast_ref::<RegistryReadError>()
+                .is_some_and(|err| needs_auth(err.status))
+        }) {
             self.invalidate_url_info(url);
         }
         result
+    }
+
+    async fn range_response(
+        &self,
+        url: &str,
+        offset: u64,
+        count: usize,
+    ) -> Result<reqwest::Response> {
+        let deadline = Instant::now() + self.timeout;
+        let request = (|| self.fetch_range_response(url, offset, count))
+            .retry(read_backoff(self.retry_count))
+            .sleep(tokio::time::sleep)
+            .when(retryable_read_error)
+            .adjust(|err, fallback| {
+                let fallback = fallback?;
+                let delay = err
+                    .downcast_ref::<RegistryReadError>()
+                    .and_then(|err| err.retry_after)
+                    .unwrap_or(fallback);
+                (delay < deadline.saturating_duration_since(Instant::now())).then_some(delay)
+            });
+        tokio::time::timeout_at(deadline.into(), request)
+            .await
+            .with_context(|| format!("timed out while reading range {offset}+{count} from {url}"))?
     }
 
     async fn read_range(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
@@ -809,29 +796,11 @@ impl RegistryFSImplV2 {
     }
 
     async fn read_range_inner(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
-        let deadline = Instant::now() + self.timeout;
-        let mut backoff = read_backoff(self.retry_count);
-        loop {
-            let remaining = remaining_timeout(deadline)?;
-            let result =
-                tokio::time::timeout(remaining, self.fetch_range_response(url, offset, count))
-                    .await
-                    .context(format!(
-                        "timed out while reading range {offset}+{count} from {url}"
-                    ))?;
-            match result {
-                Ok(resp) => {
-                    let body = resp
-                        .bytes()
-                        .await
-                        .context("read range response body failed")?;
-                    return Ok(body);
-                }
-                Err(err) => {
-                    wait_to_retry_read(err, backoff.next(), deadline).await?;
-                }
-            }
-        }
+        self.range_response(url, offset, count)
+            .await?
+            .bytes()
+            .await
+            .context("read range response body failed")
     }
 
     async fn read_range_into(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
@@ -849,40 +818,22 @@ impl RegistryFSImplV2 {
     }
 
     async fn read_range_into_inner(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        let deadline = Instant::now() + self.timeout;
-        let mut backoff = read_backoff(self.retry_count);
-        loop {
-            let remaining = remaining_timeout(deadline)?;
-            let result =
-                tokio::time::timeout(remaining, self.fetch_range_response(url, offset, dst.len()))
-                    .await
-                    .context(format!(
-                        "timed out while reading range {offset}+{} from {url}",
-                        dst.len()
-                    ))?;
-            match result {
-                Ok(mut resp) => {
-                    let mut filled = 0usize;
-                    while let Some(chunk) = resp
-                        .chunk()
-                        .await
-                        .context("read range response body failed")?
-                    {
-                        let received = filled + chunk.len();
-                        if received > dst.len() {
-                            bail!("range response larger than requested for {url} at {offset}");
-                        }
-
-                        dst[filled..received].copy_from_slice(&chunk);
-                        filled = received;
-                    }
-                    return Ok(filled);
-                }
-                Err(err) => {
-                    wait_to_retry_read(err, backoff.next(), deadline).await?;
-                }
+        let mut resp = self.range_response(url, offset, dst.len()).await?;
+        let mut filled = 0usize;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .context("read range response body failed")?
+        {
+            let received = filled + chunk.len();
+            if received > dst.len() {
+                bail!("range response larger than requested for {url} at {offset}");
             }
+
+            dst[filled..received].copy_from_slice(&chunk);
+            filled = received;
         }
+        Ok(filled)
     }
 
     async fn get_length(&self, url: &str) -> Result<u64> {
@@ -900,65 +851,32 @@ impl RegistryFSImplV2 {
             }
         }
 
-        let deadline = Instant::now() + self.timeout;
-        let mut backoff = read_backoff(self.retry_count);
-        loop {
-            let remaining = remaining_timeout(deadline)?;
-            let result = tokio::time::timeout(remaining, self.fetch_range_response(url, 0, 1))
-                .await
-                .context(format!("timed out while getting length from {url}"))?;
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let headers = resp.headers().clone();
-                    let body = resp
-                        .bytes()
-                        .await
-                        .context("read length response body failed")?;
-                    if let Some(total) = parse_content_range_total(&headers) {
-                        self.meta_sizes.insert(
-                            url.to_string(),
-                            CachedMetaSize {
-                                size: total,
-                                expire_at: Instant::now() + Self::meta_ttl(),
-                            },
-                        );
-                        return Ok(total);
-                    }
-                    if status == StatusCode::OK {
-                        let content_len = headers
-                            .get(CONTENT_LENGTH)
-                            .and_then(|x| x.to_str().ok())
-                            .and_then(|x| x.parse::<u64>().ok());
-                        if let Some(v) = content_len {
-                            self.meta_sizes.insert(
-                                url.to_string(),
-                                CachedMetaSize {
-                                    size: v,
-                                    expire_at: Instant::now() + Self::meta_ttl(),
-                                },
-                            );
-                            return Ok(v);
-                        }
-                    }
-                    let size = body.len() as u64;
-                    self.meta_sizes.insert(
-                        url.to_string(),
-                        CachedMetaSize {
-                            size,
-                            expire_at: Instant::now() + Self::meta_ttl(),
-                        },
-                    );
-                    return Ok(size);
+        let resp = self
+            .range_response(url, 0, 1)
+            .await
+            .inspect_err(|_| self.invalidate_meta_size(url))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp
+            .bytes()
+            .await
+            .context("read length response body failed")?;
+        let size = parse_content_range_total(&headers)
+            .or_else(|| {
+                if status != StatusCode::OK {
+                    return None;
                 }
-                Err(err) => {
-                    if let Err(err) = wait_to_retry_read(err, backoff.next(), deadline).await {
-                        self.invalidate_meta_size(url);
-                        return Err(err);
-                    }
-                }
-            }
-        }
+                headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
+            })
+            .unwrap_or(body.len() as u64);
+        self.meta_sizes.insert(
+            url.to_string(),
+            CachedMetaSize {
+                size,
+                expire_at: Instant::now() + Self::meta_ttl(),
+            },
+        );
+        Ok(size)
     }
 }
 
@@ -1629,7 +1547,7 @@ fn build_http_client(options: &RegistryFsV2Options) -> Result<Client> {
     builder.build().context("build http client failed")
 }
 
-impl ThrottledRead {
+impl RegistryReadError {
     fn from_response(resp: &reqwest::Response, context: String) -> Self {
         let retry_after = resp
             .headers()
@@ -1638,41 +1556,56 @@ impl ThrottledRead {
             .and_then(|value| parse_retry_after(value.trim(), SystemTime::now()));
         Self {
             context,
+            status: resp.status(),
             retry_after,
         }
     }
 }
 
-fn read_backoff(retry_count: u32) -> impl Iterator<Item = Duration> {
+fn read_backoff(retry_count: u32) -> ExponentialBuilder {
     ExponentialBuilder::new()
         .with_min_delay(Duration::from_millis(250))
         .with_max_delay(Duration::from_secs(1)) // jitter adds up to one more base interval
         .with_jitter()
         .with_max_times(retry_count as usize)
-        .build()
 }
 
-async fn wait_to_retry_read(
-    err: anyhow::Error,
-    fallback_delay: Option<Duration>,
-    deadline: Instant,
-) -> Result<()> {
-    let Some(fallback_delay) = fallback_delay else {
-        return Err(err);
-    };
-    if let Some(throttle) = err.downcast_ref::<ThrottledRead>() {
-        let delay = throttle.retry_after.unwrap_or(fallback_delay);
-        if delay >= deadline.saturating_duration_since(Instant::now()) {
-            return Err(err);
-        }
-        tokio::time::sleep(delay).await;
-        if Instant::now() >= deadline {
-            return Err(err);
-        }
-    } else {
-        tokio::time::sleep(RETRY_BACKOFF).await;
+fn needs_auth(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+fn transient_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn retryable_read_error(err: &anyhow::Error) -> bool {
+    if let Some(read) = err.downcast_ref::<RegistryReadError>() {
+        return transient_status(read.status) || needs_auth(read.status);
     }
-    Ok(())
+    if let Some(http) = err.downcast_ref::<reqwest::Error>() {
+        if http.is_connect() || http.is_timeout() || http.status().is_some_and(transient_status) {
+            return true;
+        }
+    }
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
 }
 
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -1854,15 +1787,6 @@ fn parse_upload_range_end(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = raw.strip_prefix("bytes=").unwrap_or(raw);
     let (_, end) = raw.rsplit_once('-')?;
     end.parse::<u64>().ok()
-}
-
-fn remaining_timeout(deadline: Instant) -> Result<Duration> {
-    let now = Instant::now();
-    let left = deadline.saturating_duration_since(now);
-    if left.is_zero() {
-        bail!("operation timed out");
-    }
-    Ok(left)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -2183,7 +2107,8 @@ mod tests {
         );
         assert!(parse_retry_after("-1", now).is_none());
 
-        let mut delays = read_backoff(7);
+        use backon::BackoffBuilder;
+        let mut delays = read_backoff(7).build();
         for base_ms in [250, 500, 1000, 1000, 1000, 1000, 1000] {
             let delay = delays.next().expect("retry budget");
             assert!(
@@ -2233,20 +2158,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirected_blob_retries_reuse_the_url_unless_access_is_denied() {
+        use axum::response::{IntoResponse, Redirect};
+
+        for (first_status, expected_lookups) in [
+            (StatusCode::SERVICE_UNAVAILABLE, 1),
+            (StatusCode::FORBIDDEN, 2),
+        ] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let hits = reads.clone();
+            let data = Router::new().route(
+                "/blob",
+                get(move |headers: HttpHeaderMap| {
+                    assert_eq!(headers["range"], "bytes=4-6");
+                    let first = hits.fetch_add(1, Ordering::Relaxed) == 0;
+                    async move {
+                        if first {
+                            (first_status, [("retry-after", "1")]).into_response()
+                        } else {
+                            (StatusCode::PARTIAL_CONTENT, "xyz").into_response()
+                        }
+                    }
+                }),
+            );
+            let (storage, data_server) = spawn_server(data).await;
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let probes = lookups.clone();
+            let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+                "/v2/test/blobs/digest",
+                get(move || {
+                    let lookup = probes.fetch_add(1, Ordering::Relaxed);
+                    let redirect =
+                        Redirect::temporary(&format!("{storage}/blob?signature={lookup}"));
+                    async move { redirect }
+                }),
+            );
+            let (base, registry_server) = spawn_server(registry).await;
+            let fs = RegistryFsV2::with_options(registry_test_options()).unwrap();
+            let file = fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(7));
+            let start = Instant::now();
+            assert_eq!(file.read_at(4, 3).await.unwrap().as_ref(), b"xyz");
+            assert_eq!(lookups.load(Ordering::Relaxed), expected_lookups);
+            assert_eq!(reads.load(Ordering::Relaxed), 2);
+            if first_status == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(start.elapsed() >= Duration::from_secs(1));
+            }
+            registry_server.abort();
+            data_server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn failed_layer_probes_preserve_status_and_respect_the_read_budget() {
-        for (status, hint, expected_hits) in [(429, "0", 3), (429, "600", 1), (404, "600", 3)] {
+        for (status, hint, expected_hits) in [
+            (StatusCode::TOO_MANY_REQUESTS, "0", 3),
+            (StatusCode::TOO_MANY_REQUESTS, "600", 1),
+            (StatusCode::BAD_GATEWAY, "0", 3),
+            (StatusCode::SERVICE_UNAVAILABLE, "600", 1),
+            (StatusCode::GATEWAY_TIMEOUT, "0", 3),
+            (StatusCode::NOT_FOUND, "0", 1),
+        ] {
             let hits = Arc::new(AtomicUsize::new(0));
             let probes = hits.clone();
             let app = Router::new().route("/v2/", get(|| async { "" })).route(
                 "/v2/test/blobs/digest",
                 get(move || {
                     probes.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        (
-                            HttpStatusCode::from_u16(status).unwrap(),
-                            [("retry-after", hint)],
-                        )
-                    }
+                    async move { (status, [("retry-after", hint)]) }
                 }),
             );
             let (base, server) = spawn_server(app).await;
@@ -2255,7 +2233,10 @@ mod tests {
             let err = fs.open_file(&url).await.expect_err("layer probe failed");
             assert_eq!(
                 err.to_string(),
-                format!("failed to resolve actual url for {url}: http status {status}")
+                format!(
+                    "failed to resolve actual url for {url}: http status {}",
+                    status.as_u16()
+                )
             );
             assert_eq!(hits.load(Ordering::SeqCst), expected_hits);
             server.abort();
@@ -2263,48 +2244,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn throttled_range_exhausts_one_budget_through_the_file_cache() {
+    async fn file_cache_preserves_registry_errors_and_their_retry_budget() {
         use crate::backend::cache::{FileCacheBackend, FileCacheBackendOptions};
 
-        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = ranges.clone();
-        let app = Router::new().route("/v2/", get(|| async { "" })).route(
-            "/v2/test/blobs/digest",
-            get(move |headers: axum::http::HeaderMap| {
-                let range = headers["range"].to_str().unwrap();
-                seen.lock().unwrap().push(range.to_owned());
-                let status = if range == "bytes=0-0" { 206 } else { 429 };
-                async move {
-                    Response::builder()
-                        .status(status)
-                        .header("retry-after", "0")
-                        .body(Body::empty())
-                        .unwrap()
-                }
-            }),
-        );
-        let (base, server) = spawn_server(app).await;
-        let fs = RegistryFsV2::with_options(registry_test_options()).unwrap();
-        let url = format!("{base}/v2/test/blobs/digest");
-        let source = fs.open_file_with_size_hint(&url, Some(4096));
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCacheBackend::with_options(FileCacheBackendOptions {
-            cache_dir: dir.path().to_owned(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        let file = cache
-            .open_file_with_source_size(url, source, 4096)
+        for (data_status, expected_reads) in [
+            (StatusCode::TOO_MANY_REQUESTS, 3),
+            (StatusCode::SERVICE_UNAVAILABLE, 3),
+            (StatusCode::NOT_FOUND, 1),
+        ] {
+            let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = ranges.clone();
+            let app = Router::new().route("/v2/", get(|| async { "" })).route(
+                "/v2/test/blobs/digest",
+                get(move |headers: axum::http::HeaderMap| {
+                    let range = headers["range"].to_str().unwrap();
+                    seen.lock().unwrap().push(range.to_owned());
+                    let status = if range == "bytes=0-0" {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        data_status
+                    };
+                    async move {
+                        Response::builder()
+                            .status(status)
+                            .header("retry-after", "0")
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }),
+            );
+            let (base, server) = spawn_server(app).await;
+            let fs = RegistryFsV2::with_options(registry_test_options()).unwrap();
+            let url = format!("{base}/v2/test/blobs/digest");
+            let source = fs.open_file_with_size_hint(&url, Some(4096));
+            let dir = tempfile::tempdir().unwrap();
+            let cache = FileCacheBackend::with_options(FileCacheBackendOptions {
+                cache_dir: dir.path().to_owned(),
+                ..Default::default()
+            })
             .await
             .unwrap();
-        let err = file.read_at(0, 512).await.unwrap_err();
-        assert!(err.is::<ThrottledRead>());
-        assert_eq!(
-            *ranges.lock().unwrap(),
-            ["bytes=0-0", "bytes=0-4095", "bytes=0-4095", "bytes=0-4095"]
-        );
-        server.abort();
+            let file = cache
+                .open_file_with_source_size(url, source, 4096)
+                .await
+                .unwrap();
+            let err = file.read_at(0, 512).await.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<RegistryReadError>().unwrap().status,
+                data_status
+            );
+            let mut expected = vec!["bytes=0-0"];
+            expected.extend(std::iter::repeat_n("bytes=0-4095", expected_reads));
+            assert_eq!(*ranges.lock().unwrap(), expected);
+
+            // Background prefetch reads the same file but has its own task retry loop.
+            ranges.lock().unwrap().clear();
+            let config = crate::config::DownloadConfig {
+                delay: 0,
+                delay_extra: 0,
+                try_cnt: 2,
+                ..Default::default()
+            };
+            cache
+                .submit_bk_download(file.clone(), config, None)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while cache.bk_download_registered(file.cache_id()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background read finished");
+            assert_eq!(*ranges.lock().unwrap(), expected[1..]);
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -2597,6 +2610,7 @@ mod tests {
         )
         .expect("backend");
         let blob_url = format!("{source_base}/v2/blob");
+        let start = Instant::now();
         let err = backend
             .open_file(blob_url)
             .await
@@ -2609,7 +2623,9 @@ mod tests {
             format!("{err:?}").to_lowercase().contains("http status"),
             "error should mention http status"
         );
-        assert!(accel_state.hits.load(Ordering::Relaxed) > 0);
+        assert_eq!(accel_state.hits.load(Ordering::Relaxed), 3);
+        // Two retries without Retry-After use bases of 250 ms and 500 ms, plus jitter.
+        assert!(start.elapsed() >= Duration::from_millis(750));
         assert_eq!(read_state.data_hits.load(Ordering::Relaxed), 0);
         assert!(read_state.token_hits.load(Ordering::Relaxed) > 0);
     }

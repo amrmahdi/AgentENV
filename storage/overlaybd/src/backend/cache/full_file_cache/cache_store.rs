@@ -15,7 +15,7 @@ use super::super::{
 };
 use super::cache_entry::{AcquireRefillResult, CacheEntry};
 use super::cache_pool::FileCacheBackend;
-use crate::backend::ThrottledRead;
+use crate::backend::RegistryReadError;
 #[cfg(feature = "io-uring")]
 use crate::io::vfile_io::CtxRead;
 use crate::io::vfile_io::{DirectRead, FileReader};
@@ -458,8 +458,8 @@ impl FileCacheBackend {
             // holding a clone still receive the output.
             entry.miss_fanouts.lock().remove(&block_id);
         }
-        result.map_err(|err| match err.downcast_ref::<ThrottledRead>() {
-            Some(throttled) => anyhow::Error::new(throttled.clone()),
+        result.map_err(|err| match err.downcast_ref::<RegistryReadError>() {
+            Some(source) => anyhow::Error::new(source.clone()),
             None => anyhow!("{err:#}"),
         })
     }
@@ -585,10 +585,10 @@ impl FileCacheBackend {
             refill_size,
         )
         .await
-        // A cache failure can fall back to the source. A throttled source
-        // has already exhausted its retries; reading it directly would restart them.
+        // Only cache failures can fall back to the source. A new read would
+        // restart the registry reader's retry budget.
         .or_else(|err| {
-            if err.is::<ThrottledRead>() {
+            if err.is::<RegistryReadError>() {
                 Err(err)
             } else {
                 tracing::warn!(

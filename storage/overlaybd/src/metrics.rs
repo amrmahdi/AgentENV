@@ -156,8 +156,8 @@ pub(crate) fn record_remote_metadata<T>(
 }
 
 fn classify_remote_read_error(cause: &(dyn Error + 'static)) -> Option<RemoteReadStatus> {
-    if cause.is::<crate::backend::ThrottledRead>() {
-        return Some(RemoteReadStatus::RateLimited);
+    if let Some(err) = cause.downcast_ref::<crate::backend::RegistryReadError>() {
+        return Some(RemoteReadStatus::from_http_status(err.status.as_u16()));
     }
     if cause.is::<tokio::time::error::Elapsed>() {
         return Some(RemoteReadStatus::Timeout);

@@ -11,12 +11,13 @@ pub mod tar;
 #[cfg(feature = "full")]
 pub use registryfs_v2 as remote;
 
-/// A layer read that received HTTP 429. Outer image/cache fallbacks must
-/// preserve the reader's retry budget when this reaches them.
+/// An HTTP failure from the registry blob reader. Outer cache and image fallbacks
+/// propagate it so they cannot restart the reader's retry budget.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{context}: http status 429")]
-pub(crate) struct ThrottledRead {
+#[error("{context}: http status {}", .status.as_u16())]
+pub(crate) struct RegistryReadError {
     context: String,
+    pub(crate) status: http::StatusCode,
     #[cfg(feature = "full")]
     retry_after: Option<std::time::Duration>,
 }

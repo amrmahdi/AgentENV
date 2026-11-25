@@ -5172,6 +5172,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "hex",
+ "http",
  "httpdate",
  "libc",
  "lz4-sys",
